@@ -144,29 +144,32 @@ class Loggers():
     def on_model_save(self, last, epoch, final_epoch, best_fitness, fi):
         # Callback runs on model save event
         if self.wandb:
-            if ((epoch + 1) % self.opt.save_period == 0 and not final_epoch) and self.opt.save_period != -1:
+            if ((epoch + 1) % self.opt.save_period == 0) and self.opt.save_period != -1:
                 self.wandb.log_model(last.parent, self.opt, epoch, fi, best_model=best_fitness == fi)
 
     def on_train_end(self, last, best, plots, epoch, results):
         # Callback runs on training end
-        if plots:
-            plot_results(file=self.save_dir / 'results.csv')  # save results.png
-        files = [f'ep{epoch}_results.png', f'ep{epoch}_confusion_matrix.png', *(f'ep{epoch}_{x}_curve.png' for x in ('F1', 'PR', 'P', 'R'))]
-        files = [(self.save_dir / f) for f in files if (self.save_dir / f).exists()]  # filter
+        # if plots:
+        #     plot_results(file=self.save_dir / 'results.csv')  # save results.png
+        # files = [f'ep{epoch}_results.png', f'ep{epoch}_confusion_matrix.png', *(f'ep{epoch}_{x}_curve.png' for x in ('F1', 'PR', 'P', 'R'))]
+        # files = [(self.save_dir / f) for f in files if (self.save_dir / f).exists()]  # filter
+        #
+        # if self.tb:
+        #     import cv2
+        #     for f in files:
+        #         self.tb.add_image(f.stem, cv2.imread(str(f))[..., ::-1], epoch, dataformats='HWC')
+        #
+        # if self.wandb:
+        #     self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
+        #     # Calling wandb.log. TODO: Refactor this into WandbLogger.log_model
+        #     if not self.opt.evolve:
+        #         wandb.log_artifact(str(best if best.exists() else last), type='model',
+        #                            name='run_' + self.wandb.wandb_run.id + '_model',
+        #                            aliases=['latest', 'best', 'stripped'])
+        #         self.wandb.finish_run()
+        #     else:
+        #         self.wandb.finish_run()
+        #         self.wandb = WandbLogger(self.opt)
 
-        if self.tb:
-            import cv2
-            for f in files:
-                self.tb.add_image(f.stem, cv2.imread(str(f))[..., ::-1], epoch, dataformats='HWC')
-
-        if self.wandb:
-            self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
-            # Calling wandb.log. TODO: Refactor this into WandbLogger.log_model
-            if not self.opt.evolve:
-                wandb.log_artifact(str(best if best.exists() else last), type='model',
-                                   name='run_' + self.wandb.wandb_run.id + '_model',
-                                   aliases=['latest', 'best', 'stripped'])
-                self.wandb.finish_run()
-            else:
-                self.wandb.finish_run()
-                self.wandb = WandbLogger(self.opt)
+        # since we are not evaluating, just stop
+        self.wandb.finish_run()
