@@ -43,11 +43,18 @@ FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
 
 
+class JPEGErrorFilter(logging.Filter):
+    def filter(self, record):
+        return False if record.msg.startswith('Corrupt JPEG') else True
+
+
 def set_logging(name=None, verbose=True):
     # Sets level and returns logger
     rank = int(os.getenv('RANK', -1))  # rank in world for Multi-GPU trainings
     logging.basicConfig(format="%(message)s", level=logging.INFO if (verbose and rank in (-1, 0)) else logging.WARNING)
-    return logging.getLogger(name)
+    logger = logging.getLogger(name)
+    logger.addFilter(JPEGErrorFilter())
+    return logger
 
 
 LOGGER = set_logging(__name__)  # define globally (used in train.py, val.py, detect.py, etc.)

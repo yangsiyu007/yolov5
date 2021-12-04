@@ -52,7 +52,9 @@ from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_devic
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
-WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
+WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1)) # number of devices/GPUs
+
+LOGGER.info(f'Env vars: LOCAL_RANK {LOCAL_RANK}, RANK {RANK}, WORLD_SIZE {WORLD_SIZE}')
 
 
 def train(hyp,  # path/to/hyp.yaml or hyp dictionary
@@ -220,9 +222,10 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
 
     # Process 0
     if RANK in [-1, 0]:
+        # MODIFIED - not using rect, and shuffle
         val_loader = create_dataloader(val_path, imgsz, batch_size // WORLD_SIZE * 2, gs, single_cls,
-                                       hyp=hyp, cache=None if noval else opt.cache, rect=True, rank=-1,
-                                       workers=workers, pad=0.5,
+                                       hyp=hyp, cache=None if noval else opt.cache, rank=-1,
+                                       workers=workers, pad=0.5, rect=opt.rect, shuffle=True,
                                        prefix=colorstr('val: '))[0]
 
         if not resume:
@@ -243,6 +246,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # DDP mode
     if cuda and RANK != -1:
         model = DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
+        LOGGER.info('Using DistributedDataParallel')
 
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
@@ -258,6 +262,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Start training
     t0 = time.time()
     nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
+    LOGGER.info(f'Number of warmup iterations: {nw}')
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     last_opt_step = -1
     maps = np.zeros(nc)  # mAP per class
@@ -283,7 +288,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        mloss = torch.zeros(3, device=device)  # mean losses - box, obj, cls
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
@@ -341,7 +346,7 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
                     f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
-                callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, opt.sync_bn)
+                callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots, opt.sync_bn, mloss)
             # end batch ------------------------------------------------------------------------------------------------
 
         # Scheduler
@@ -354,23 +359,27 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:  # Calculate mAP
-                results, maps, _ = val.run(data_dict,
+                results, maps, maps50, _ = val.run(data_dict,
                                            batch_size=batch_size // WORLD_SIZE * 2,
                                            imgsz=imgsz,
                                            model=ema.ema,
                                            single_cls=single_cls,
                                            dataloader=val_loader,
                                            save_dir=save_dir,
+                                           verbose=True,
                                            plots=False,
                                            callbacks=callbacks,
                                            compute_loss=compute_loss)
 
-            # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            if fi > best_fitness:
-                best_fitness = fi
-            log_vals = list(mloss) + list(results) + lr
-            callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+                # Update best mAP
+                fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+                if fi > best_fitness:
+                    best_fitness = fi
+                log_vals = list(mloss) + list(results) + lr + list(maps[:nc]) + list(maps50[:nc])
+                callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
+
+                # if best_fitness == fi: # save best
+                #     torch.save(ckpt, best)
 
             # Save model
             if (not nosave) or (final_epoch and not evolve):  # if save
@@ -383,20 +392,19 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                         'wandb_id': loggers.wandb.wandb_run.id if loggers.wandb else None,
                         'date': datetime.now().isoformat()}
 
-                # Save last, best and delete
+                # Save last and delete
                 torch.save(ckpt, last)
-                if best_fitness == fi:
-                    torch.save(ckpt, best)
-                if (epoch > 0) and (opt.save_period > 0) and (epoch % opt.save_period == 0):
+
+                if (opt.save_period > 0) and (epoch % opt.save_period == 0):
                     torch.save(ckpt, w / f'epoch{epoch}.pt')
                 del ckpt
-                callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
+                callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, None) # fi = None
 
             # Stop Single-GPU
             if RANK == -1 and stopper(epoch=epoch, fitness=fi):
                 break
 
-            # Stop DDP TODO: known issues shttps://github.com/ultralytics/yolov5/pull/4576
+            # Stop DDP TODO: known issues https://github.com/ultralytics/yolov5/pull/4576
             # stop = stopper(epoch=epoch, fitness=fi)
             # if RANK == 0:
             #    dist.broadcast_object_list([stop], 0)  # broadcast 'stop' to all ranks
@@ -415,21 +423,22 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                 strip_optimizer(f)  # strip optimizers
                 if f is best:
                     LOGGER.info(f'\nValidating {f}...')
-                    results, _, _ = val.run(data_dict,
-                                            batch_size=batch_size // WORLD_SIZE * 2,
-                                            imgsz=imgsz,
-                                            model=attempt_load(f, device).half(),
-                                            iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
-                                            single_cls=single_cls,
-                                            dataloader=val_loader,
-                                            save_dir=save_dir,
-                                            save_json=is_coco,
-                                            verbose=True,
-                                            plots=True,
-                                            callbacks=callbacks,
-                                            compute_loss=compute_loss)  # val best model with plots
+                    results, maps, maps50, _ = val.run(data_dict,
+                                               batch_size=batch_size // WORLD_SIZE * 2,
+                                               imgsz=imgsz,
+                                               model=attempt_load(f, device).half(),
+                                               iou_thres=0.65 if is_coco else 0.60,  # best pycocotools results at 0.65
+                                               single_cls=single_cls,
+                                               dataloader=val_loader,
+                                               save_dir=save_dir,
+                                               save_json=is_coco,
+                                               verbose=True,
+                                               plots=True,
+                                               callbacks=callbacks,
+                                               compute_loss=compute_loss)  # val best model with plots
                     if is_coco:
-                        callbacks.run('on_fit_epoch_end', list(mloss) + list(results) + lr, epoch, best_fitness, fi)
+                        log_vals = list(mloss) + list(results) + lr + list(maps[:nc]) + list(maps50[:nc])
+                        callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
         callbacks.run('on_train_end', last, best, plots, epoch, results)
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")

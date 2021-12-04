@@ -138,7 +138,7 @@ class WandbLogger():
         self.val_table, self.result_table = None, None
         self.bbox_media_panel_images = []
         self.val_table_path_map = None
-        self.max_imgs_to_log = 16
+        self.max_imgs_to_log = 32
         self.wandb_artifact_data_dict = None
         self.data_dict = None
         # It's more elegant to stick to 1 wandb.init call,
@@ -475,6 +475,10 @@ class WandbLogger():
         if self.wandb_run:
             for key, value in log_dict.items():
                 self.log_dict[key] = value
+
+    def log_and_flush(self, log_dict):
+        if self.wandb_run:
+            wandb.log(log_dict)
 
     def end_epoch(self, best_result=False):
         """

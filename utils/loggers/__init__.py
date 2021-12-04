@@ -40,10 +40,15 @@ class Loggers():
         self.hyp = hyp
         self.logger = logger  # for printing results to console
         self.include = include
-        self.keys = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
-                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',  # metrics
-                     'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
-                     'x/lr0', 'x/lr1', 'x/lr2']  # params
+        self.keys = [
+            'train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
+            'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',  # metrics
+            'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+            'x/lr0', 'x/lr1', 'x/lr2', # params
+            # hard-coded per-class metrics for the 3 classes
+            'metrics/mAP_0.5:0.95_class0', 'metrics/mAP_0.5:0.95_class1', 'metrics/mAP_0.5:0.95_class2',
+            'metrics/mAP_0.5_class0', 'metrics/mAP_0.5_class1', 'metrics/mAP_0.5_class2'
+        ]
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary
         self.csv = True  # always log to csv
@@ -76,7 +81,7 @@ class Loggers():
         if self.wandb:
             self.wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in paths]})
 
-    def on_train_batch_end(self, ni, model, imgs, targets, paths, plots, sync_bn):
+    def on_train_batch_end(self, ni, model, imgs, targets, paths, plots, sync_bn, mloss):
         # Callback runs on train batch end
         if plots:
             if ni == 0:
@@ -87,9 +92,20 @@ class Loggers():
             if ni < 3:
                 f = self.save_dir / f'train_batch{ni}.jpg'  # filename
                 Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
-            if self.wandb and ni == 10:
+            if self.wandb and ni == 100:
                 files = sorted(self.save_dir.glob('train*.jpg'))
-                self.wandb.log({'Mosaics': [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})
+                self.wandb.log_and_flush({'Mosaics': [wandb.Image(str(f), caption=f.name) for f in files if f.exists()]})
+
+            # log training loss more frequently
+            if self.wandb and ni % 200 == 0:
+                box_loss, obj_loss, cls_loss = mloss[0], mloss[1], mloss[2]
+                self.wandb.log_and_flush({
+                        'train_monitor/box_loss': box_loss,
+                        'train_monitor/obj_loss': obj_loss,
+                        'train_monitor/cls_loss': cls_loss,
+                        'batch': ni
+                })
+
 
     def on_train_epoch_end(self, epoch):
         # Callback runs on train epoch end
@@ -135,7 +151,7 @@ class Loggers():
         # Callback runs on training end
         if plots:
             plot_results(file=self.save_dir / 'results.csv')  # save results.png
-        files = ['results.png', 'confusion_matrix.png', *(f'{x}_curve.png' for x in ('F1', 'PR', 'P', 'R'))]
+        files = [f'ep{epoch}_results.png', f'ep{epoch}_confusion_matrix.png', *(f'ep{epoch}_{x}_curve.png' for x in ('F1', 'PR', 'P', 'R'))]
         files = [(self.save_dir / f) for f in files if (self.save_dir / f).exists()]  # filter
 
         if self.tb:
